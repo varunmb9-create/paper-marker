@@ -11,6 +11,14 @@ from google.genai import types
 st.set_page_config(page_title="Paper Marker", layout="centered")
 st.title("📝 Question Paper Auto-Marker")
 
+# Initialize Session State so downloads don't reset the page
+if "annotated_pages" not in st.session_state:
+    st.session_state.annotated_pages = []
+if "pdf_data" not in st.session_state:
+    st.session_state.pdf_data = None
+if "answer_key" not in st.session_state:
+    st.session_state.answer_key = None
+
 # Retrieve API key
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
@@ -43,7 +51,6 @@ def generate_with_fallback(contents, config=None):
     raise RuntimeError("API servers are currently busy. Please retry in a few moments.")
 
 def optimize_image(uploaded_file, max_dim=1600):
-    """Downsamples huge camera files to keep memory well within Render's free RAM limit."""
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -62,6 +69,11 @@ if q_files and ans_file:
     st.write(f"📁 **{len(q_files)} page(s) ready.**")
 
     if st.button("Mark Answers"):
+        # Reset previous run data
+        st.session_state.annotated_pages = []
+        st.session_state.pdf_data = None
+        st.session_state.answer_key = None
+
         # Step 1: Read Answer Key
         with st.spinner("Reading answer key..."):
             ans_img = optimize_image(ans_file, max_dim=1200)
@@ -74,21 +86,18 @@ if q_files and ans_file:
                 contents=[ans_img, key_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            answer_key = json.loads(key_response.text)
-            st.success(f"Detected {len(answer_key)} answers from key.")
-            st.json(answer_key)
+            st.session_state.answer_key = json.loads(key_response.text)
 
-        annotated_pages = []
+        annotated_list = []
 
         # Step 2: Annotate Question Pages
         for idx, file in enumerate(q_files):
-            st.markdown(f"--- \n### 📄 Page {idx + 1}")
-            q_img = optimize_image(file, max_dim=1600)
+            with st.spinner(f"Marking choices on Page {idx + 1}..."):
+                q_img = optimize_image(file, max_dim=1600)
 
-            with st.spinner(f"Marking correct choices on Page {idx + 1}..."):
                 detect_prompt = f"""
                 You are an exam paper annotator. 
-                Answer key: {json.dumps(answer_key)}
+                Answer key: {json.dumps(st.session_state.answer_key)}
 
                 CRITICAL RULES:
                 1. Every question (1, 2, 3...) has exactly four options (A, B, C, D) and ONLY ONE correct answer.
@@ -113,67 +122,74 @@ if q_files and ans_file:
                 except Exception:
                     detections = []
 
-            # Hard filter: Enforce strictly 1 answer per question
-            unique_detections = {}
-            for item in detections:
-                q_no = str(item.get("q_no", "")).strip()
-                if q_no and q_no not in unique_detections:
-                    unique_detections[q_no] = item
+                # Deduplicate: enforce strictly 1 answer per question
+                unique_detections = {}
+                for item in detections:
+                    q_no = str(item.get("q_no", "")).strip()
+                    if q_no and q_no not in unique_detections:
+                        unique_detections[q_no] = item
 
-            st.write(f"Successfully marked **{len(unique_detections)}** single-choice questions on this page.")
+                annotated_img = q_img.copy()
+                draw = ImageDraw.Draw(annotated_img)
+                w, h = annotated_img.size
 
-            annotated_img = q_img.copy()
-            draw = ImageDraw.Draw(annotated_img)
-            w, h = annotated_img.size
+                for q_no, item in unique_detections.items():
+                    box = item.get("box_2d")
+                    if box and len(box) == 4:
+                        ymin, xmin, ymax, xmax = box
+                        top = max(0, int((ymin / 1000) * h))
+                        left = max(0, int((xmin / 1000) * w))
+                        bottom = min(h, int((ymax / 1000) * h))
+                        right = min(w, int((xmax / 1000) * w))
 
-            for q_no, item in unique_detections.items():
-                box = item.get("box_2d")
-                if box and len(box) == 4:
-                    ymin, xmin, ymax, xmax = box
-                    top = max(0, int((ymin / 1000) * h))
-                    left = max(0, int((xmin / 1000) * w))
-                    bottom = min(h, int((ymax / 1000) * h))
-                    right = min(w, int((xmax / 1000) * w))
+                        pad = 4
+                        draw.ellipse(
+                            [left - pad, top - pad, right + pad, bottom + pad],
+                            outline="#00DD00",
+                            width=5
+                        )
 
-                    # Draw a distinct green circle/badge around just the single correct option letter
-                    pad = 4
-                    draw.ellipse(
-                        [left - pad, top - pad, right + pad, bottom + pad],
-                        outline="#00DD00",
-                        width=5
-                    )
+                annotated_list.append(annotated_img)
+                gc.collect()
 
-            annotated_pages.append(annotated_img)
-            st.image(annotated_img, caption=f"Marked Page {idx + 1}", use_container_width=True)
+        st.session_state.annotated_pages = annotated_list
 
-            # Individual Page JPG Download Button
-            img_buf = BytesIO()
-            annotated_img.save(img_buf, format="JPEG", quality=90)
-            st.download_button(
-                label=f"⬇️ Download Page {idx + 1} (JPG)",
-                data=img_buf.getvalue(),
-                file_name=f"marked_page_{idx + 1}.jpg",
-                mime="image/jpeg",
-                key=f"dl_page_{idx + 1}"
-            )
-
-            gc.collect()
-
-        # Step 3: Combined PDF Download Button
-        if annotated_pages:
-            st.markdown("---")
+        # Pre-compile the combined PDF into session state
+        if annotated_list:
             pdf_buf = BytesIO()
-            annotated_pages[0].save(
-                pdf_buf, 
-                format="PDF", 
-                save_all=True, 
-                append_images=annotated_pages[1:] if len(annotated_pages) > 1 else []
+            annotated_list[0].save(
+                pdf_buf,
+                format="PDF",
+                save_all=True,
+                append_images=annotated_list[1:] if len(annotated_list) > 1 else []
             )
+            st.session_state.pdf_data = pdf_buf.getvalue()
 
-            st.download_button(
-                label="📥 Download All Marked Pages as Single PDF",
-                data=pdf_buf.getvalue(),
-                file_name="all_marked_question_pages.pdf",
-                mime="application/pdf",
-                key="dl_all_pdf"
-            )
+# Display persisted results from session state
+if st.session_state.annotated_pages:
+    st.success(f"Detected {len(st.session_state.answer_key)} answers in key.")
+    
+    if st.session_state.pdf_data:
+        st.download_button(
+            label="📥 Download All Marked Pages as Single PDF",
+            data=st.session_state.pdf_data,
+            file_name="all_marked_pages.pdf",
+            mime="application/pdf",
+            key="btn_download_pdf"
+        )
+        st.markdown("---")
+
+    for idx, page_img in enumerate(st.session_state.annotated_pages):
+        st.subheader(f"📄 Page {idx + 1}")
+        st.image(page_img, caption=f"Marked Page {idx + 1}", use_container_width=True)
+
+        img_buf = BytesIO()
+        page_img.save(img_buf, format="JPEG", quality=90)
+        st.download_button(
+            label=f"⬇️ Download Page {idx + 1} (JPG)",
+            data=img_buf.getvalue(),
+            file_name=f"marked_page_{idx + 1}.jpg",
+            mime="image/jpeg",
+            key=f"btn_dl_page_{idx + 1}"
+        )
+        st.markdown("---")
