@@ -20,6 +20,9 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
+# Model configuration
+MODEL_NAME = "gemini-3.8-flash"
+
 # Allow multiple question pages
 q_files = st.file_uploader(
     "1. Upload Question Paper Pages (Select multiple)", 
@@ -40,7 +43,7 @@ if q_files and ans_file:
                 "Output strictly a JSON mapping like: {\"1\": \"A\", \"2\": \"C\", ...}"
             )
             key_response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=MODEL_NAME,
                 contents=[ans_img, key_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -67,7 +70,7 @@ if q_files and ans_file:
             """
             
             box_response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=MODEL_NAME,
                 contents=[q_img, detect_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
