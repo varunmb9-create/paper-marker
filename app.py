@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from io import BytesIO
 import streamlit as st
 from PIL import Image, ImageDraw
@@ -20,8 +21,26 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-# Model configuration
-MODEL_NAME = "gemini-3.8-flash"
+# High-availability model list (falls back if one is busy)
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
+
+def generate_with_fallback(contents, config=None):
+    """Tries models sequentially with retry to handle 503 traffic spikes."""
+    for model_name in MODELS:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                err_msg = str(e)
+                if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                    time.sleep(2)  # Wait briefly for traffic spike to clear
+                    continue
+                break  # If other error, try next model
+    raise RuntimeError("All models are currently experiencing high traffic. Please try again in 1-2 minutes.")
 
 # Allow multiple question pages
 q_files = st.file_uploader(
@@ -42,8 +61,7 @@ if q_files and ans_file:
                 "Extract all question numbers and their corresponding correct options from this answer key. "
                 "Output strictly a JSON mapping like: {\"1\": \"A\", \"2\": \"C\", ...}"
             )
-            key_response = client.models.generate_content(
-                model=MODEL_NAME,
+            key_response = generate_with_fallback(
                 contents=[ans_img, key_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -69,8 +87,7 @@ if q_files and ans_file:
             ]
             """
             
-            box_response = client.models.generate_content(
-                model=MODEL_NAME,
+            box_response = generate_with_fallback(
                 contents=[q_img, detect_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -99,7 +116,7 @@ if q_files and ans_file:
             st.image(annotated_img, caption=f"Page {idx + 1} Marked", use_container_width=True)
             progress_bar.progress((idx + 1) / len(q_files))
 
-        # Step 3: Bundle all annotated pages into a single PDF
+        # Step 3: Bundle into a single PDF
         if annotated_pages:
             pdf_buf = BytesIO()
             first_page = annotated_pages[0]
