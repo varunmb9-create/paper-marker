@@ -11,7 +11,6 @@ from google.genai import types
 st.set_page_config(page_title="Paper Marker", layout="centered")
 st.title("📝 Question Paper Auto-Marker")
 
-# Initialize Session State so downloads don't reset the page
 if "annotated_pages" not in st.session_state:
     st.session_state.annotated_pages = []
 if "pdf_data" not in st.session_state:
@@ -19,7 +18,6 @@ if "pdf_data" not in st.session_state:
 if "answer_key" not in st.session_state:
     st.session_state.answer_key = None
 
-# Retrieve API key
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     api_key = st.text_input("Enter Gemini API Key", type="password")
@@ -33,7 +31,6 @@ client = genai.Client(api_key=api_key)
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
 
 def generate_with_fallback(contents, config=None):
-    """Fallback handler to bypass traffic surges and 503 limits."""
     for model_name in MODELS:
         for attempt in range(2):
             try:
@@ -48,9 +45,10 @@ def generate_with_fallback(contents, config=None):
                     time.sleep(2)
                     continue
                 break
-    raise RuntimeError("API servers are currently busy. Please retry in a few moments.")
+    raise RuntimeError("API servers busy. Please retry in a moment.")
 
-def optimize_image(uploaded_file, max_dim=1600):
+def optimize_image(uploaded_file, max_dim=1800):
+    """Keeps higher resolution so small Malayalam option labels are razor sharp."""
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -69,18 +67,16 @@ if q_files and ans_file:
     st.write(f"📁 **{len(q_files)} page(s) ready.**")
 
     if st.button("Mark Answers"):
-        # Reset previous run data
         st.session_state.annotated_pages = []
         st.session_state.pdf_data = None
         st.session_state.answer_key = None
 
         # Step 1: Read Answer Key
-        with st.spinner("Reading answer key..."):
-            ans_img = optimize_image(ans_file, max_dim=1200)
+        with st.spinner("Extracting Answer Key..."):
+            ans_img = optimize_image(ans_file, max_dim=1400)
             key_prompt = (
-                "Extract all question numbers and their corresponding correct options from this answer key image. "
-                "Every question has strictly one correct answer from A, B, C, or D. "
-                "Output strictly a JSON key-value map, like: {\"1\": \"A\", \"2\": \"B\", \"3\": \"C\"}."
+                "Extract all question numbers (1, 2, 3...) and their single correct option (A, B, C, or D) from this answer key. "
+                "Output strictly a JSON object: {\"1\": \"A\", \"2\": \"D\", ...}"
             )
             key_response = generate_with_fallback(
                 contents=[ans_img, key_prompt],
@@ -90,25 +86,27 @@ if q_files and ans_file:
 
         annotated_list = []
 
-        # Step 2: Annotate Question Pages
+        # Step 2: Annotate Question Pages using Anchored Option Detection
         for idx, file in enumerate(q_files):
-            with st.spinner(f"Marking choices on Page {idx + 1}..."):
-                q_img = optimize_image(file, max_dim=1600)
+            with st.spinner(f"Accurately locating options for Page {idx + 1}..."):
+                q_img = optimize_image(file, max_dim=1800)
 
                 detect_prompt = f"""
-                You are an exam paper annotator. 
-                Answer key: {json.dumps(st.session_state.answer_key)}
+                You are an expert OCR document analyzer.
+                Answer Key: {json.dumps(st.session_state.answer_key)}
 
-                CRITICAL RULES:
-                1. Every question (1, 2, 3...) has exactly four options (A, B, C, D) and ONLY ONE correct answer.
-                2. Only check questions from the answer key that actually appear on this page.
-                3. For each question, locate ONLY the correct option letter label itself (e.g. 'A', 'B', 'C', 'D' or '(A)', '(B)', '(C)', '(D)').
-                4. NEVER mark multiple options for the same question number. Strictly ONE label box per question.
-                5. Coordinates must be normalized [0, 1000] in format [ymin, xmin, ymax, xmax].
+                INSTRUCTIONS:
+                1. Identify the question numbers (1, 2, 3, etc.) located on the LEFT side of each question.
+                2. For each question number found on this page that exists in the answer key:
+                   - Look ONLY inside the immediate body/options block belonging to that specific question number.
+                   - Do NOT jump across columns or look into other questions.
+                   - Locate the bounding box of ONLY the correct option label symbol: e.g. 'A', 'B', 'C', 'D' or '(A)', '(B)', '(C)', '(D)'.
+                3. STRICT RULE: Output exactly ONE bounding box per question number.
+                4. Coordinates must be normalized integers [0, 1000] in format [ymin, xmin, ymax, xmax].
 
-                Output strictly a JSON list:
+                Output format strictly as JSON:
                 [
-                  {{"q_no": "1", "option_letter": "A", "box_2d": [ymin, xmin, ymax, xmax]}}
+                  {{"q_no": "1", "matched_option": "B", "box_2d": [ymin, xmin, ymax, xmax]}}
                 ]
                 """
 
@@ -122,7 +120,7 @@ if q_files and ans_file:
                 except Exception:
                     detections = []
 
-                # Deduplicate: enforce strictly 1 answer per question
+                # Enforce strictly 1 mark per question
                 unique_detections = {}
                 for item in detections:
                     q_no = str(item.get("q_no", "")).strip()
@@ -142,11 +140,14 @@ if q_files and ans_file:
                         bottom = min(h, int((ymax / 1000) * h))
                         right = min(w, int((xmax / 1000) * w))
 
-                        pad = 4
+                        # Draw a clear green circle around the option letter
+                        pad_x = max(3, int((right - left) * 0.2))
+                        pad_y = max(3, int((bottom - top) * 0.2))
+                        
                         draw.ellipse(
-                            [left - pad, top - pad, right + pad, bottom + pad],
-                            outline="#00DD00",
-                            width=5
+                            [left - pad_x, top - pad_y, right + pad_x, bottom + pad_y],
+                            outline="#00E600",
+                            width=4
                         )
 
                 annotated_list.append(annotated_img)
@@ -154,7 +155,6 @@ if q_files and ans_file:
 
         st.session_state.annotated_pages = annotated_list
 
-        # Pre-compile the combined PDF into session state
         if annotated_list:
             pdf_buf = BytesIO()
             annotated_list[0].save(
@@ -165,15 +165,15 @@ if q_files and ans_file:
             )
             st.session_state.pdf_data = pdf_buf.getvalue()
 
-# Display persisted results from session state
+# Persistent UI Display
 if st.session_state.annotated_pages:
-    st.success(f"Detected {len(st.session_state.answer_key)} answers in key.")
+    st.success(f"Detected {len(st.session_state.answer_key)} questions in Answer Key.")
     
     if st.session_state.pdf_data:
         st.download_button(
-            label="📥 Download All Marked Pages as Single PDF",
+            label="📥 Download All Marked Pages as PDF",
             data=st.session_state.pdf_data,
-            file_name="all_marked_pages.pdf",
+            file_name="marked_paper.pdf",
             mime="application/pdf",
             key="btn_download_pdf"
         )
