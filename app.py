@@ -1,23 +1,17 @@
 import os
 import json
 import time
-import gc
 from io import BytesIO
 import streamlit as st
-import streamlit.components.v1 as components
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="Paper Marker & Floating Key", layout="centered")
+st.set_page_config(page_title="Paper Answer Key Extractor", layout="centered")
+st.title("📝 Question Paper & Key Tool")
 
-# Persistent state
 if "answer_key" not in st.session_state:
     st.session_state.answer_key = None
-if "processed_pages" not in st.session_state:
-    st.session_state.processed_pages = []
-if "pdf_data" not in st.session_state:
-    st.session_state.pdf_data = None
 
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
@@ -48,7 +42,7 @@ def generate_with_fallback(contents, config=None):
                 break
     raise RuntimeError("API busy. Please retry.")
 
-def optimize_image(uploaded_file, max_dim=2000):
+def optimize_image(uploaded_file, max_dim=1800):
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -56,98 +50,21 @@ def optimize_image(uploaded_file, max_dim=2000):
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     return img
 
-def inject_floating_widget(answer_key_dict):
-    """Renders a floating expandable bubble widget directly on the screen."""
-    sorted_items = sorted(
-        answer_key_dict.items(),
-        key=lambda x: int(x[0]) if x[0].isdigit() else 999
-    )
-    
-    rows_html = "".join([
-        f"""
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid #e2e8f0; font-family:sans-serif;">
-            <span style="font-weight:600; color:#334155; font-size:16px;">Q.{q}</span>
-            <span style="background:#0f172a; color:#ffffff; font-weight:700; padding:4px 12px; border-radius:6px; font-size:16px;">{ans}</span>
-        </div>
-        """
-        for q, ans in sorted_items
-    ])
-
-    widget_code = f"""
-    <div id="float-container" style="position:fixed; bottom:25px; right:20px; z-index:999999;">
-        <!-- Collapsed Floating Button -->
-        <button id="float-btn" onclick="toggleWidget()" style="
-            width: 58px;
-            height: 58px;
-            border-radius: 50%;
-            background: #2563eb;
-            color: white;
-            border: none;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
-            font-size: 24px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;">
-            📝
-        </button>
-
-        <!-- Expanded Vertical Sidebar -->
-        <div id="float-panel" style="
-            display: none;
-            width: 200px;
-            height: 380px;
-            background: #ffffff;
-            border-radius: 14px;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.3);
-            border: 2px solid #2563eb;
-            flex-direction: column;
-            overflow: hidden;">
-            
-            <div style="background:#2563eb; color:white; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; font-family:sans-serif; font-weight:bold;">
-                <span>Key List</span>
-                <span onclick="toggleWidget()" style="cursor:pointer; font-size:18px;">✕</span>
-            </div>
-            
-            <div style="overflow-y:auto; flex:1; background:#f8fafc;">
-                {rows_html}
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function toggleWidget() {{
-            var btn = document.getElementById("float-btn");
-            var panel = document.getElementById("float-panel");
-            if (panel.style.display === "none" || panel.style.display === "") {{
-                panel.style.display = "flex";
-                btn.style.display = "none";
-            }} else {{
-                panel.style.display = "none";
-                btn.style.display = "flex";
-            }}
-        }}
-    </script>
-    """
-    components.html(widget_code, height=0)
-
-st.title("📄 Question Paper & Floating Answer Key")
-
-# File Uploaders
-q_files = st.file_uploader(
-    "1. Upload Question Pages", 
-    type=["png", "jpg", "jpeg"], 
-    accept_multiple_files=True
-)
-ans_file = st.file_uploader("2. Upload Answer Key Page", type=["png", "jpg", "jpeg"])
+ans_file = st.file_uploader("Upload Answer Key Page", type=["png", "jpg", "jpeg"])
 
 if ans_file:
-    if st.button("Extract Answer Key & Launch Floating Tool"):
-        with st.spinner("Extracting Answer Key..."):
+    if st.button("Extract Answer Key"):
+        with st.spinner("Extracting Answer Key accurately..."):
             ans_img = optimize_image(ans_file, max_dim=1800)
             key_prompt = """
-            Extract all question numbers (1 to 100) and their single correct option (A, B, C, or D) from this answer key image.
-            Ignore mathematical solutions, explanations, and formulas.
+            Focus specifically on the section titled 'Answers with Explanation' or the answer key block.
+            Notice the formatted answers listed like:
+            1(b), 2(a), 3(c), 4(c), 5(a), 6(b), 7(c)...
+            and any standalone answer listings like:
+            71. (d), 72. (d), 74. (c), 80. (a), 81(a), 82(b), 89(a), 90(b)... up to 100.
+
+            Extract ALL questions from 1 to 100 with their corresponding single letter option (A, B, C, or D).
+            IGNORE calculations, dates (like 2020), and mathematical formulas in the explanations.
             Output strictly a clean JSON object:
             {"1": "B", "2": "A", "3": "C", ...}
             """
@@ -159,24 +76,49 @@ if ans_file:
             st.session_state.answer_key = {str(k).strip(): str(v).strip().upper() for k, v in raw_key.items()}
             st.success(f"Detected {len(st.session_state.answer_key)} answers!")
 
-# When Answer Key is active
 if st.session_state.answer_key:
-    # Inject the floating widget onto the webpage
-    inject_floating_widget(st.session_state.answer_key)
-    
-    st.subheader("💡 Floating Widget Active")
-    st.info("Tap the blue round 📝 icon at the bottom-right of your screen to toggle the scrollable answer bar open and closed!")
+    st.markdown("---")
+    st.subheader("📋 Formatted Key for Notes App")
 
-    # Format text for Android external floating apps
-    sorted_key = sorted(st.session_state.answer_key.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 999)
-    raw_text_key = "\n".join([f"Q.{q} : {ans}" for q, ans in sorted_key])
-    
-    st.download_button(
-        label="📋 Download Key as Plain Text File (.txt)",
-        data=raw_text_key,
-        file_name="answer_key.txt",
-        mime="text/plain"
+    sorted_items = sorted(
+        st.session_state.answer_key.items(),
+        key=lambda x: int(x[0]) if x[0].isdigit() else 999
     )
 
-    with st.expander("Show Raw Answer Key List"):
-        st.text_area("Answer Key Copy-Paste", raw_text_key, height=200)
+    # Formatted with high-contrast bold text, clear arrows, and large spacing
+    bold_copy_text = "\n\n".join([
+        f"Q.{str(q).zfill(2)}   ➔   【  {ans}  】"
+        for q, ans in sorted_items
+    ])
+
+    # Big bold styled preview on the webpage
+    st.markdown(
+        """
+        <style>
+        .stTextArea textarea {
+            font-size: 26px !important;
+            font-weight: 800 !important;
+            font-family: monospace, sans-serif !important;
+            color: #22c55e !important;
+            background-color: #0f172a !important;
+            line-height: 2 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.write("Tap inside the box below, select all, and copy:")
+    st.text_area(
+        label="Copy Text",
+        value=bold_copy_text,
+        height=350,
+        label_visibility="collapsed"
+    )
+
+    st.download_button(
+        label="📥 Download Bold Key (.txt)",
+        data=bold_copy_text,
+        file_name="bold_answer_key.txt",
+        mime="text/plain"
+    )
