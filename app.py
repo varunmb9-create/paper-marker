@@ -11,6 +11,7 @@ from google.genai import types
 st.set_page_config(page_title="Paper Marker", layout="centered")
 st.title("📝 Question Paper Auto-Marker")
 
+# Retrieve API key
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     api_key = st.text_input("Enter Gemini API Key", type="password")
@@ -24,6 +25,7 @@ client = genai.Client(api_key=api_key)
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
 
 def generate_with_fallback(contents, config=None):
+    """Fallback handler to bypass traffic surges and 503 limits."""
     for model_name in MODELS:
         for attempt in range(2):
             try:
@@ -38,9 +40,10 @@ def generate_with_fallback(contents, config=None):
                     time.sleep(2)
                     continue
                 break
-    raise RuntimeError("API service busy. Please retry in a moment.")
+    raise RuntimeError("API servers are currently busy. Please retry in a few moments.")
 
 def optimize_image(uploaded_file, max_dim=1600):
+    """Downsamples huge camera files to keep memory well within Render's free RAM limit."""
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -60,10 +63,11 @@ if q_files and ans_file:
 
     if st.button("Mark Answers"):
         # Step 1: Read Answer Key
-        with st.spinner("Step 1: Reading Answer Key..."):
+        with st.spinner("Reading answer key..."):
             ans_img = optimize_image(ans_file, max_dim=1200)
             key_prompt = (
                 "Extract all question numbers and their corresponding correct options from this answer key image. "
+                "Every question has strictly one correct answer from A, B, C, or D. "
                 "Output strictly a JSON key-value map, like: {\"1\": \"A\", \"2\": \"B\", \"3\": \"C\"}."
             )
             key_response = generate_with_fallback(
@@ -71,7 +75,7 @@ if q_files and ans_file:
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             answer_key = json.loads(key_response.text)
-            st.success(f"Extracted {len(answer_key)} answers from key:")
+            st.success(f"Detected {len(answer_key)} answers from key.")
             st.json(answer_key)
 
         annotated_pages = []
@@ -81,20 +85,21 @@ if q_files and ans_file:
             st.markdown(f"--- \n### 📄 Page {idx + 1}")
             q_img = optimize_image(file, max_dim=1600)
 
-            with st.spinner(f"Detecting question locations on Page {idx + 1}..."):
+            with st.spinner(f"Marking correct choices on Page {idx + 1}..."):
                 detect_prompt = f"""
-                You are an exam paper grader analyzing this question paper page.
-                Here is the ground truth answer key mapping:
-                {json.dumps(answer_key)}
+                You are an exam paper annotator. 
+                Answer key: {json.dumps(answer_key)}
 
-                Your task:
-                1. Identify which questions from the answer key are printed on this page.
-                2. For each question found, locate the bounding box of the CORRECT OPTION letter or text (e.g. A, B, C, D or 1, 2, 3, 4).
-                3. Bounding box coordinates must be normalized between 0 and 1000 in [ymin, xmin, ymax, xmax] format.
+                CRITICAL RULES:
+                1. Every question (1, 2, 3...) has exactly four options (A, B, C, D) and ONLY ONE correct answer.
+                2. Only check questions from the answer key that actually appear on this page.
+                3. For each question, locate ONLY the correct option letter label itself (e.g. 'A', 'B', 'C', 'D' or '(A)', '(B)', '(C)', '(D)').
+                4. NEVER mark multiple options for the same question number. Strictly ONE label box per question.
+                5. Coordinates must be normalized [0, 1000] in format [ymin, xmin, ymax, xmax].
 
                 Output strictly a JSON list:
                 [
-                  {{"q_no": "1", "ans": "A", "box_2d": [ymin, xmin, ymax, xmax]}}
+                  {{"q_no": "1", "option_letter": "A", "box_2d": [ymin, xmin, ymax, xmax]}}
                 ]
                 """
 
@@ -108,14 +113,20 @@ if q_files and ans_file:
                 except Exception:
                     detections = []
 
-            st.write(f"Found **{len(detections)}** marked questions on this page.")
+            # Hard filter: Enforce strictly 1 answer per question
+            unique_detections = {}
+            for item in detections:
+                q_no = str(item.get("q_no", "")).strip()
+                if q_no and q_no not in unique_detections:
+                    unique_detections[q_no] = item
 
-            # Draw green highlighter / box on the image
+            st.write(f"Successfully marked **{len(unique_detections)}** single-choice questions on this page.")
+
             annotated_img = q_img.copy()
             draw = ImageDraw.Draw(annotated_img)
             w, h = annotated_img.size
 
-            for item in detections:
+            for q_no, item in unique_detections.items():
                 box = item.get("box_2d")
                 if box and len(box) == 4:
                     ymin, xmin, ymax, xmax = box
@@ -124,18 +135,33 @@ if q_files and ans_file:
                     bottom = min(h, int((ymax / 1000) * h))
                     right = min(w, int((xmax / 1000) * w))
 
-                    # Expand slightly for visibility
-                    draw.rectangle(
-                        [left - 4, top - 2, right + 4, bottom + 2], 
-                        outline="#00FF00", 
-                        width=6
+                    # Draw a distinct green circle/badge around just the single correct option letter
+                    pad = 4
+                    draw.ellipse(
+                        [left - pad, top - pad, right + pad, bottom + pad],
+                        outline="#00DD00",
+                        width=5
                     )
 
             annotated_pages.append(annotated_img)
             st.image(annotated_img, caption=f"Marked Page {idx + 1}", use_container_width=True)
+
+            # Individual Page JPG Download Button
+            img_buf = BytesIO()
+            annotated_img.save(img_buf, format="JPEG", quality=90)
+            st.download_button(
+                label=f"⬇️ Download Page {idx + 1} (JPG)",
+                data=img_buf.getvalue(),
+                file_name=f"marked_page_{idx + 1}.jpg",
+                mime="image/jpeg",
+                key=f"dl_page_{idx + 1}"
+            )
+
             gc.collect()
 
+        # Step 3: Combined PDF Download Button
         if annotated_pages:
+            st.markdown("---")
             pdf_buf = BytesIO()
             annotated_pages[0].save(
                 pdf_buf, 
@@ -145,8 +171,9 @@ if q_files and ans_file:
             )
 
             st.download_button(
-                label="📥 Download Marked PDF",
+                label="📥 Download All Marked Pages as Single PDF",
                 data=pdf_buf.getvalue(),
-                file_name="marked_paper.pdf",
-                mime="application/pdf"
+                file_name="all_marked_question_pages.pdf",
+                mime="application/pdf",
+                key="dl_all_pdf"
             )
