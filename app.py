@@ -9,7 +9,7 @@ from google import genai
 from google.genai import types
 
 st.set_page_config(page_title="Paper Marker", layout="centered")
-st.title("📝 Question Paper Auto-Marker")
+st.title("📝 Question Paper Auto-Marker (Multi-Column)")
 
 if "annotated_pages" not in st.session_state:
     st.session_state.annotated_pages = []
@@ -23,7 +23,7 @@ if not api_key:
     api_key = st.text_input("Enter Gemini API Key", type="password")
 
 if not api_key:
-    st.info("Please enter your Gemini API Key to begin.")
+    st.info("Please enter your Gemini API Key to proceed.")
     st.stop()
 
 client = genai.Client(api_key=api_key)
@@ -45,10 +45,9 @@ def generate_with_fallback(contents, config=None):
                     time.sleep(2)
                     continue
                 break
-    raise RuntimeError("API servers busy. Please retry in a moment.")
+    raise RuntimeError("API busy. Please retry.")
 
-def optimize_image(uploaded_file, max_dim=1800):
-    """Keeps higher resolution so small Malayalam option labels are razor sharp."""
+def optimize_image(uploaded_file, max_dim=2200):
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -57,7 +56,7 @@ def optimize_image(uploaded_file, max_dim=1800):
     return img
 
 q_files = st.file_uploader(
-    "1. Upload Question Paper Pages", 
+    "1. Upload Question Pages (Newspaper format)", 
     type=["png", "jpg", "jpeg"], 
     accept_multiple_files=True
 )
@@ -72,86 +71,94 @@ if q_files and ans_file:
         st.session_state.answer_key = None
 
         # Step 1: Read Answer Key
-        with st.spinner("Extracting Answer Key..."):
-            ans_img = optimize_image(ans_file, max_dim=1400)
+        with st.spinner("Extracting complete Answer Key..."):
+            ans_img = optimize_image(ans_file, max_dim=1600)
             key_prompt = (
-                "Extract all question numbers (1, 2, 3...) and their single correct option (A, B, C, or D) from this answer key. "
-                "Output strictly a JSON object: {\"1\": \"A\", \"2\": \"D\", ...}"
+                "Extract all question numbers (1, 2, 3... up to 100) and their exact single correct option (A, B, C, or D) "
+                "from this answer key image (e.g. from 'Answers with Explanation' box). "
+                "Format strictly as JSON map: {\"1\": \"B\", \"2\": \"A\", \"3\": \"C\", ...}"
             )
             key_response = generate_with_fallback(
                 contents=[ans_img, key_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            st.session_state.answer_key = json.loads(key_response.text)
+            raw_key = json.loads(key_response.text)
+            # Normalize to uppercase
+            st.session_state.answer_key = {str(k).strip(): str(v).strip().upper() for k, v in raw_key.items()}
+            st.success(f"Extracted {len(st.session_state.answer_key)} answers from key.")
 
         annotated_list = []
 
-        # Step 2: Annotate Question Pages using Anchored Option Detection
-        for idx, file in enumerate(q_files):
-            with st.spinner(f"Accurately locating options for Page {idx + 1}..."):
-                q_img = optimize_image(file, max_dim=1800)
+        # Step 2: Annotate Question Pages using 4-Column Strip Division
+        for page_idx, file in enumerate(q_files):
+            st.markdown(f"--- \n### 📄 Processing Page {page_idx + 1}")
+            full_img = optimize_image(file, max_dim=2200)
+            img_w, img_h = full_img.size
+            annotated_img = full_img.copy()
+            draw = ImageDraw.Draw(annotated_img)
 
-                detect_prompt = f"""
-                You are an expert OCR document analyzer.
+            # Define 4 column strips with slight overlap
+            num_cols = 4
+            col_width = img_w / num_cols
+
+            col_progress = st.progress(0)
+            for c in range(num_cols):
+                col_left = max(0, int(c * col_width - 15))
+                col_right = min(img_w, int((c + 1) * col_width + 15))
+                
+                # Crop vertical strip
+                col_crop = full_img.crop((col_left, 0, col_right, img_h))
+                c_w, c_h = col_crop.size
+
+                strip_prompt = f"""
+                You are analyzing a SINGLE COLUMN vertical strip of a question paper.
                 Answer Key: {json.dumps(st.session_state.answer_key)}
 
-                INSTRUCTIONS:
-                1. Identify the question numbers (1, 2, 3, etc.) located on the LEFT side of each question.
-                2. For each question number found on this page that exists in the answer key:
-                   - Look ONLY inside the immediate body/options block belonging to that specific question number.
-                   - Do NOT jump across columns or look into other questions.
-                   - Locate the bounding box of ONLY the correct option label symbol: e.g. 'A', 'B', 'C', 'D' or '(A)', '(B)', '(C)', '(D)'.
-                3. STRICT RULE: Output exactly ONE bounding box per question number.
-                4. Coordinates must be normalized integers [0, 1000] in format [ymin, xmin, ymax, xmax].
+                RULES:
+                1. Identify which question numbers appear in this single vertical column.
+                2. For each question in this column, locate the exact bounding box around the CORRECT OPTION letter label:
+                   (a), (b), (c), or (d) matching the answer key.
+                3. Do NOT mark question numbers or question text. Circle ONLY the letter label itself.
+                4. Coordinates must be normalized integers [0, 1000] relative to THIS COLUMN STRIP: [ymin, xmin, ymax, xmax].
 
-                Output format strictly as JSON:
+                Output JSON:
                 [
                   {{"q_no": "1", "matched_option": "B", "box_2d": [ymin, xmin, ymax, xmax]}}
                 ]
                 """
 
-                box_response = generate_with_fallback(
-                    contents=[q_img, detect_prompt],
-                    config=types.GenerateContentConfig(response_mime_type="application/json")
-                )
-
                 try:
+                    box_response = generate_with_fallback(
+                        contents=[col_crop, strip_prompt],
+                        config=types.GenerateContentConfig(response_mime_type="application/json")
+                    )
                     detections = json.loads(box_response.text)
                 except Exception:
                     detections = []
 
-                # Enforce strictly 1 mark per question
-                unique_detections = {}
+                # Draw detections back onto the full page
                 for item in detections:
-                    q_no = str(item.get("q_no", "")).strip()
-                    if q_no and q_no not in unique_detections:
-                        unique_detections[q_no] = item
-
-                annotated_img = q_img.copy()
-                draw = ImageDraw.Draw(annotated_img)
-                w, h = annotated_img.size
-
-                for q_no, item in unique_detections.items():
                     box = item.get("box_2d")
                     if box and len(box) == 4:
                         ymin, xmin, ymax, xmax = box
-                        top = max(0, int((ymin / 1000) * h))
-                        left = max(0, int((xmin / 1000) * w))
-                        bottom = min(h, int((ymax / 1000) * h))
-                        right = min(w, int((xmax / 1000) * w))
+                        # Map strip coordinates back to full image space
+                        top = max(0, int((ymin / 1000) * c_h))
+                        bottom = min(img_h, int((ymax / 1000) * c_h))
+                        left = max(0, int(col_left + (xmin / 1000) * c_w))
+                        right = min(img_w, int(col_left + (xmax / 1000) * c_w))
 
-                        # Draw a clear green circle around the option letter
-                        pad_x = max(3, int((right - left) * 0.2))
-                        pad_y = max(3, int((bottom - top) * 0.2))
-                        
+                        # Draw green highlight circle around the option label
+                        pad = 4
                         draw.ellipse(
-                            [left - pad_x, top - pad_y, right + pad_x, bottom + pad_y],
+                            [left - pad, top - pad, right + pad, bottom + pad],
                             outline="#00E600",
                             width=4
                         )
 
-                annotated_list.append(annotated_img)
+                col_progress.progress((c + 1) / num_cols)
                 gc.collect()
+
+            annotated_list.append(annotated_img)
 
         st.session_state.annotated_pages = annotated_list
 
@@ -165,9 +172,9 @@ if q_files and ans_file:
             )
             st.session_state.pdf_data = pdf_buf.getvalue()
 
-# Persistent UI Display
+# Display Results and Downloads
 if st.session_state.annotated_pages:
-    st.success(f"Detected {len(st.session_state.answer_key)} questions in Answer Key.")
+    st.success("✅ All columns annotated successfully!")
     
     if st.session_state.pdf_data:
         st.download_button(
@@ -184,7 +191,7 @@ if st.session_state.annotated_pages:
         st.image(page_img, caption=f"Marked Page {idx + 1}", use_container_width=True)
 
         img_buf = BytesIO()
-        page_img.save(img_buf, format="JPEG", quality=90)
+        page_img.save(img_buf, format="JPEG", quality=92)
         st.download_button(
             label=f"⬇️ Download Page {idx + 1} (JPG)",
             data=img_buf.getvalue(),
