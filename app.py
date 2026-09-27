@@ -4,15 +4,15 @@ import time
 import gc
 from io import BytesIO
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="Paper Marker", layout="centered")
-st.title("📝 Question Paper Auto-Marker (Multi-Column)")
+st.set_page_config(page_title="Paper Answer Key Appender", layout="centered")
+st.title("📄 Question Paper + Answer Key Table")
 
-if "annotated_pages" not in st.session_state:
-    st.session_state.annotated_pages = []
+if "processed_pages" not in st.session_state:
+    st.session_state.processed_pages = []
 if "pdf_data" not in st.session_state:
     st.session_state.pdf_data = None
 if "answer_key" not in st.session_state:
@@ -47,7 +47,7 @@ def generate_with_fallback(contents, config=None):
                 break
     raise RuntimeError("API busy. Please retry.")
 
-def optimize_image(uploaded_file, max_dim=2200):
+def optimize_image(uploaded_file, max_dim=2000):
     img = Image.open(uploaded_file).convert("RGB")
     w, h = img.size
     if max(w, h) > max_dim:
@@ -55,27 +55,84 @@ def optimize_image(uploaded_file, max_dim=2200):
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     return img
 
+def render_answer_table(page_img, page_keys):
+    """Draws a clean, multi-column answer grid directly below the question sheet."""
+    img_w, img_h = page_img.size
+    
+    # Sort items by numeric question number
+    sorted_items = sorted(
+        page_keys.items(), 
+        key=lambda x: int(x[0]) if x[0].isdigit() else 999
+    )
+    
+    if not sorted_items:
+        return page_img
+
+    # Grid layout calculation: 10 items per row
+    cols_per_row = 10
+    num_items = len(sorted_items)
+    num_rows = (num_items + cols_per_row - 1) // cols_per_row
+    
+    cell_height = 42
+    header_height = 50
+    table_height = header_height + (num_rows * cell_height) + 30
+    
+    # Create combined canvas
+    new_img = Image.new("RGB", (img_w, img_h + table_height), color=(245, 247, 250))
+    new_img.paste(page_img, (0, 0))
+    
+    draw = ImageDraw.Draw(new_img)
+    
+    # Section Header Banner
+    header_top = img_h + 10
+    draw.rectangle([0, header_top, img_w, header_top + 36], fill=(30, 41, 59))
+    draw.text((25, header_top + 8), "ANSWER KEY FOR THIS PAGE", fill=(255, 255, 255))
+
+    # Calculate column widths
+    margin_x = 20
+    available_w = img_w - (2 * margin_x)
+    col_w = available_w / cols_per_row
+
+    # Draw Table Cells
+    for idx, (q_num, ans) in enumerate(sorted_items):
+        r = idx // cols_per_row
+        c = idx % cols_per_row
+        
+        x0 = margin_x + (c * col_w)
+        y0 = header_top + 45 + (r * cell_height)
+        x1 = x0 + col_w - 4
+        y1 = y0 + cell_height - 4
+        
+        # Cell background card
+        draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255), outline=(203, 213, 225), width=2)
+        
+        # Content formatting: "Q.1 : [B]"
+        cell_text = f"Q.{q_num}: {ans}"
+        draw.text((x0 + 8, y0 + 10), cell_text, fill=(15, 23, 42))
+
+    return new_img
+
 q_files = st.file_uploader(
-    "1. Upload Question Pages (Newspaper format)", 
+    "1. Upload Question Pages (Newspaper / Paper format)", 
     type=["png", "jpg", "jpeg"], 
     accept_multiple_files=True
 )
 ans_file = st.file_uploader("2. Upload Answer Key Page", type=["png", "jpg", "jpeg"])
 
 if q_files and ans_file:
-    st.write(f"📁 **{len(q_files)} page(s) ready.**")
+    st.write(f"📁 **{len(q_files)} question page(s) ready.**")
 
-    if st.button("Mark Answers"):
-        st.session_state.annotated_pages = []
+    if st.button("Generate Answer Keys Below Pages"):
+        st.session_state.processed_pages = []
         st.session_state.pdf_data = None
         st.session_state.answer_key = None
 
-        # Step 1: Read Answer Key
-        with st.spinner("Extracting complete Answer Key..."):
+        # Step 1: Read Complete Answer Key
+        with st.spinner("Extracting complete answer key..."):
             ans_img = optimize_image(ans_file, max_dim=1600)
             key_prompt = (
                 "Extract all question numbers (1, 2, 3... up to 100) and their exact single correct option (A, B, C, or D) "
-                "from this answer key image (e.g. from 'Answers with Explanation' box). "
+                "from this answer key image (e.g., from 'Answers with Explanation' box). "
                 "Format strictly as JSON map: {\"1\": \"B\", \"2\": \"A\", \"3\": \"C\", ...}"
             )
             key_response = generate_with_fallback(
@@ -83,119 +140,85 @@ if q_files and ans_file:
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             raw_key = json.loads(key_response.text)
-            # Normalize to uppercase
             st.session_state.answer_key = {str(k).strip(): str(v).strip().upper() for k, v in raw_key.items()}
-            st.success(f"Extracted {len(st.session_state.answer_key)} answers from key.")
+            st.success(f"Extracted {len(st.session_state.answer_key)} total answers from key.")
 
-        annotated_list = []
+        processed_list = []
 
-        # Step 2: Annotate Question Pages using 4-Column Strip Division
-        for page_idx, file in enumerate(q_files):
-            st.markdown(f"--- \n### 📄 Processing Page {page_idx + 1}")
-            full_img = optimize_image(file, max_dim=2200)
-            img_w, img_h = full_img.size
-            annotated_img = full_img.copy()
-            draw = ImageDraw.Draw(annotated_img)
+        # Step 2: Identify Questions on each page & append footer table
+        for idx, file in enumerate(q_files):
+            st.markdown(f"--- \n### 📄 Analyzing Page {idx + 1}")
+            page_img = optimize_image(file, max_dim=2000)
 
-            # Define 4 column strips with slight overlap
-            num_cols = 4
-            col_width = img_w / num_cols
-
-            col_progress = st.progress(0)
-            for c in range(num_cols):
-                col_left = max(0, int(c * col_width - 15))
-                col_right = min(img_w, int((c + 1) * col_width + 15))
-                
-                # Crop vertical strip
-                col_crop = full_img.crop((col_left, 0, col_right, img_h))
-                c_w, c_h = col_crop.size
-
-                strip_prompt = f"""
-                You are analyzing a SINGLE COLUMN vertical strip of a question paper.
-                Answer Key: {json.dumps(st.session_state.answer_key)}
-
-                RULES:
-                1. Identify which question numbers appear in this single vertical column.
-                2. For each question in this column, locate the exact bounding box around the CORRECT OPTION letter label:
-                   (a), (b), (c), or (d) matching the answer key.
-                3. Do NOT mark question numbers or question text. Circle ONLY the letter label itself.
-                4. Coordinates must be normalized integers [0, 1000] relative to THIS COLUMN STRIP: [ymin, xmin, ymax, xmax].
-
-                Output JSON:
-                [
-                  {{"q_no": "1", "matched_option": "B", "box_2d": [ymin, xmin, ymax, xmax]}}
-                ]
+            with st.spinner(f"Detecting which questions appear on Page {idx + 1}..."):
+                range_prompt = """
+                Examine this question paper page.
+                Identify all question numbers that appear on this page (e.g. 1 to 30, or 31 to 70).
+                Return strictly a JSON list of integers representing every question number present on this page:
+                [1, 2, 3, 4, 5, ...]
                 """
-
+                
+                resp = generate_with_fallback(
+                    contents=[page_img, range_prompt],
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                
                 try:
-                    box_response = generate_with_fallback(
-                        contents=[col_crop, strip_prompt],
-                        config=types.GenerateContentConfig(response_mime_type="application/json")
-                    )
-                    detections = json.loads(box_response.text)
+                    present_q_nums = json.loads(resp.text)
                 except Exception:
-                    detections = []
+                    present_q_nums = []
 
-                # Draw detections back onto the full page
-                for item in detections:
-                    box = item.get("box_2d")
-                    if box and len(box) == 4:
-                        ymin, xmin, ymax, xmax = box
-                        # Map strip coordinates back to full image space
-                        top = max(0, int((ymin / 1000) * c_h))
-                        bottom = min(img_h, int((ymax / 1000) * c_h))
-                        left = max(0, int(col_left + (xmin / 1000) * c_w))
-                        right = min(img_w, int(col_left + (xmax / 1000) * c_w))
+                # Filter global answer key for only the questions present on this page
+                page_answers = {}
+                for q_num in present_q_nums:
+                    q_str = str(q_num).strip()
+                    if q_str in st.session_state.answer_key:
+                        page_answers[q_str] = st.session_state.answer_key[q_str]
 
-                        # Draw green highlight circle around the option label
-                        pad = 4
-                        draw.ellipse(
-                            [left - pad, top - pad, right + pad, bottom + pad],
-                            outline="#00E600",
-                            width=4
-                        )
+                st.write(f"Found **{len(page_answers)}** questions for this page.")
 
-                col_progress.progress((c + 1) / num_cols)
+                # Render combined image with table appended below
+                final_page_img = render_answer_table(page_img, page_answers)
+                processed_list.append(final_page_img)
                 gc.collect()
 
-            annotated_list.append(annotated_img)
+        st.session_state.processed_pages = processed_list
 
-        st.session_state.annotated_pages = annotated_list
-
-        if annotated_list:
+        # Step 3: Bundle into single PDF
+        if processed_list:
             pdf_buf = BytesIO()
-            annotated_list[0].save(
+            processed_list[0].save(
                 pdf_buf,
                 format="PDF",
                 save_all=True,
-                append_images=annotated_list[1:] if len(annotated_list) > 1 else []
+                append_images=processed_list[1:] if len(processed_list) > 1 else []
             )
             st.session_state.pdf_data = pdf_buf.getvalue()
 
-# Display Results and Downloads
-if st.session_state.annotated_pages:
-    st.success("✅ All columns annotated successfully!")
+# Display Persistent Results & Downloads
+if st.session_state.processed_pages:
+    st.success("✅ Answer key tables successfully appended to all pages!")
     
     if st.session_state.pdf_data:
         st.download_button(
-            label="📥 Download All Marked Pages as PDF",
+            label="📥 Download All Pages with Answer Tables as PDF",
             data=st.session_state.pdf_data,
-            file_name="marked_paper.pdf",
+            file_name="paper_with_answer_keys.pdf",
             mime="application/pdf",
             key="btn_download_pdf"
         )
         st.markdown("---")
 
-    for idx, page_img in enumerate(st.session_state.annotated_pages):
+    for idx, page_img in enumerate(st.session_state.processed_pages):
         st.subheader(f"📄 Page {idx + 1}")
-        st.image(page_img, caption=f"Marked Page {idx + 1}", use_container_width=True)
+        st.image(page_img, caption=f"Page {idx + 1} with Answer Key Table", use_container_width=True)
 
         img_buf = BytesIO()
         page_img.save(img_buf, format="JPEG", quality=92)
         st.download_button(
             label=f"⬇️ Download Page {idx + 1} (JPG)",
             data=img_buf.getvalue(),
-            file_name=f"marked_page_{idx + 1}.jpg",
+            file_name=f"page_{idx + 1}_with_answers.jpg",
             mime="image/jpeg",
             key=f"btn_dl_page_{idx + 1}"
         )
